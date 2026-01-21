@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.http.ResponseEntity;
 import uk.ac.ed.inf.ilp.constant.OrderValidationCode;
+import uk.ac.ed.inf.ilp.constant.SystemConstants;
 import uk.ac.ed.inf.ilp.data.*;
 import ilp.tutorials.pizzadronz.controllers.PizzaDronzController;
 
@@ -31,6 +32,40 @@ public class PizzaDronzControllerTest {
         o.setCreditCardInformation(new CreditCardInformation("4485959141852684", "10/26", "816"));
         return o;
     }
+
+    private PizzaDronzController controllerWithStubbedRestaurants() {
+        PizzaDronzController spy = Mockito.spy(controller);
+
+        Restaurant r1 = mock(Restaurant.class);
+        when(r1.name()).thenReturn("Rest1");
+        when(r1.location()).thenReturn(new LngLat(-3.1912869215011597, 55.945535152517735));
+        when(r1.menu()).thenReturn(new Pizza[]{
+                new Pizza("R1: Margarita", 1000),
+                new Pizza("R1: Pepperoni", 1200)
+        });
+
+        Restaurant r4 = mock(Restaurant.class);
+        when(r4.name()).thenReturn("Rest4");
+        when(r4.location()).thenReturn(new LngLat(-3.1900, 55.9440));
+        when(r4.menu()).thenReturn(new Pizza[]{
+                new Pizza("R4: Proper Pizza", 1400),
+                new Pizza("R4: Pineapple & Ham & Cheese", 900)
+        });
+
+        doReturn(new Restaurant[]{ r1, r4 })
+                .when(spy).fetchAndParse(eq("/restaurants"), eq(Restaurant[].class));
+
+        return spy;
+    }
+
+    private void setTotalToSumPlusCharge(Order o) {
+        int sum = 0;
+        if (o.getPizzasInOrder() != null) {
+            for (Pizza p : o.getPizzasInOrder()) sum += p.priceInPence();
+        }
+        o.setPriceTotalInPence(sum + SystemConstants.ORDER_CHARGE_IN_PENCE);
+    }
+
 
     @Test
     public void testValidateOrder_ValidOrder() {
@@ -154,7 +189,6 @@ public class PizzaDronzControllerTest {
         assertEquals("Failed to fetch restaurant data", ex.getMessage());
     }
 
-
     @Test
     public void testCalculateDistance() {
         LngLat pos1 = new LngLat(-3.1878, 55.9445);
@@ -178,5 +212,119 @@ public class PizzaDronzControllerTest {
             controller.validateCoordinates(invalidCoordinates);
         });
         assertEquals("Longitude must be between -180 and 180.", exception.getMessage());
+    }
+
+
+    @Test
+    public void testValidateOrder_InvalidExpiryDate_Format() {
+        Order invalidOrder = makeValidOrder();
+        invalidOrder.setCreditCardInformation(new CreditCardInformation("4485959141852684", "2026-10", "816"));
+
+        ResponseEntity<?> response = controller.validateOrder(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.EXPIRY_DATE_INVALID, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testValidateOrder_InvalidExpiryDate_InPast() {
+        Order invalidOrder = makeValidOrder();
+        // definitely in the past relative to Jan 2026
+        invalidOrder.setCreditCardInformation(new CreditCardInformation("4485959141852684", "01/20", "816"));
+
+        ResponseEntity<?> response = controller.validateOrder(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.EXPIRY_DATE_INVALID, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testValidateOrder_InvalidCVV() {
+        Order invalidOrder = makeValidOrder();
+        invalidOrder.setCreditCardInformation(new CreditCardInformation("4485959141852684", "10/26", "12"));
+
+        ResponseEntity<?> response = controller.validateOrder(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.CVV_INVALID, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testValidateOrder_MaxPizzaCountExceeded() {
+        Order invalidOrder = makeValidOrder();
+
+        int tooMany = SystemConstants.MAX_PIZZAS_PER_ORDER + 1;
+        Pizza[] pizzas = new Pizza[tooMany];
+        for (int i = 0; i < tooMany; i++) {
+            pizzas[i] = new Pizza("R1: Margarita", 1000);
+        }
+        invalidOrder.setPizzasInOrder(pizzas);
+
+        // Ensure we don't trip TOTAL_INCORRECT before max-count check
+        setTotalToSumPlusCharge(invalidOrder);
+
+        ResponseEntity<?> response = controller.validateOrder(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.MAX_PIZZA_COUNT_EXCEEDED, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testValidateOrder_PizzasFromMultipleRestaurants() {
+        // This needs stubbing, otherwise it hits the real /restaurants API
+        PizzaDronzController spy = controllerWithStubbedRestaurants();
+
+        Order invalidOrder = makeValidOrder();
+        invalidOrder.setPizzasInOrder(new Pizza[]{
+                new Pizza("R1: Margarita", 1000),
+                new Pizza("R4: Proper Pizza", 1400)
+        });
+        setTotalToSumPlusCharge(invalidOrder);
+
+        ResponseEntity<?> response = spy.validateOrder(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.PIZZA_FROM_MULTIPLE_RESTAURANTS, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testCalcDeliveryPath_InvalidOrder_ReturnsOrderWithCode() {
+        Order invalidOrder = new Order();
+
+        ResponseEntity<?> response = controller.calcDeliveryPath(invalidOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertTrue(response.getBody() instanceof Order);
+        Order returned = (Order) response.getBody();
+        assertEquals(OrderValidationCode.EMPTY_ORDER, returned.getOrderValidationCode());
+    }
+
+    @Test
+    public void testCalcDeliveryPath_ValidOrder_ReturnsPathList() {
+        // Avoids network by stubbing restaurants AND calculatePath
+        PizzaDronzController spy = controllerWithStubbedRestaurants();
+
+        Order validOrder = makeValidOrder();
+
+        doReturn(List.of(
+                new LngLat(-3.1912869215011597, 55.945535152517735),
+                new LngLat(SystemConstants.APPLETON_LNG, SystemConstants.APPLETON_LAT)
+        )).when(spy).calculatePath(any(Order.class));
+
+        ResponseEntity<?> response = spy.calcDeliveryPath(validOrder);
+
+        assertEquals(200, response.getStatusCodeValue());
+        assertNotNull(response.getBody());
+        assertTrue(response.getBody() instanceof List<?>);
     }
 }
